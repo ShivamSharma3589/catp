@@ -1,296 +1,296 @@
-# CAT Dealer Snapshot — Data Model
+# CAT Dealer Snapshot — Data Analysis
 
-How the data is split, what each table holds, and which part of the UI reads it.
-
----
-
-## 1. Where data lives
-
-| Store | Holds | Written by |
-|---|---|---|
-| **BigQuery** | Campaign metadata, daily performance facts, creatives | The ingestion jobs that will call the Google Ads, Meta and LinkedIn APIs |
-| **PostgreSQL** | Users, KPI targets, notes, flags, status overrides | The dashboard itself, through the API |
-
-The rule: **BigQuery is what the ad platforms tell us, Postgres is what our users tell us.** Nothing the user types ever goes to BigQuery, and no API sync ever writes to Postgres.
-
-A campaign is identified everywhere by the pair **`(platform, campaign_id)`**, where `campaign_id` is the platform's own native id (numeric for Google/Meta, a `urn:li:sponsoredCampaign:…` for LinkedIn). Postgres rows reference campaigns by that pair rather than a foreign key, because the campaign row itself lives in BigQuery.
+What the dashboard displays, where each number comes from, how the data is structured, and what is still unconfirmed.
 
 ---
 
-## 2. BigQuery tables
+## 1. Scope
 
-Dataset: `BIGQUERY_PROJECT.BIGQUERY_DATASET`. DDL lives in `analytics/schema/*.sql` and is applied with `manage.py bq_init`.
+A reporting dashboard for CAT dealer advertising across four markets (IT, FR, UK, DE) and four platforms (Google, YouTube, Meta, LinkedIn) — 64 campaigns in total.
 
-### 2.1 `campaigns` — one row per campaign
+It is **read-only**. Campaigns are created and managed in each platform's own tools; this dashboard reports on them and adds a layer of commentary — targets, notes and flagged issues — that the platforms have no concept of.
 
-Clustered by `platform, market, campaign_id`.
+The analysis below separates every value on screen into three kinds:
 
-| Column | Type | Notes |
-|---|---|---|
-| `platform` | STRING | `google` / `youtube` / `meta` / `linkedin` |
-| `market` | STRING | `IT` / `FR` / `UK` / `DE` |
-| `ad_account_id` | STRING | Native account id or URN |
-| `campaign_id` | STRING | Native id, always text — never cast to a number |
-| `campaign_name` | STRING | Shown as the card and table title |
-| `campaign_type` / `campaign_type_raw` | STRING | Normalised type and the untouched platform value |
-| `objective` / `objective_raw` | STRING | Same pattern |
-| `funnel_stage` | STRING | `upper` / `mid` / `lower` / `full` |
-| `product_category` | STRING | Brand, Mini Excavators, Compact Wheel Loaders, Multi-Product |
-| `ad_format` | STRING | Display label under the campaign name ("Display, Video") |
-| `primary_kpi` | STRING | Which KPI this campaign is judged on |
-| `platform_status` / `platform_status_raw` | STRING | Serving state from the platform — **not** the On/At Risk/Off Track badge |
-| `effective_status` | STRING | Platform eligibility, where provided |
-| `start_date` / `end_date` | DATE | Campaign schedule |
-| `budget_amount` / `budget_period` | NUMERIC / STRING | Daily or lifetime |
-| `currency` | STRING | ISO code, from the account |
-| `source_updated_at` | TIMESTAMP | Platform's own last-modified |
-| `synced_at` | TIMESTAMP | When we fetched it — drives the freshness indicator |
+| Kind | Meaning |
+|---|---|
+| **Sourced** | Comes from a platform advertising API |
+| **Calculated** | Derived by us from sourced values |
+| **Unconfirmed** | Appears on screen, but has no identified source yet |
 
-### 2.2 `campaign_performance_daily` — one row per campaign per day
-
-Partitioned by `date`, clustered by `platform, market, campaign_id`. **This is the only table that should ever be aggregated**, and every number on the dashboard ultimately comes from it.
-
-| Column | Type | Notes |
-|---|---|---|
-| `platform`, `market`, `campaign_id` | STRING | Join keys back to `campaigns` |
-| `date` | DATE | Partition key; report date in the account timezone |
-| `impressions`, `reach`, `clicks` | INT64 | `reach` is not available on every platform |
-| `video_views`, `video_completions` | INT64 | NULL for non-video formats |
-| `conversions`, `conversion_value` | NUMERIC | "Leads" in the UI |
-| `spend` | NUMERIC | Decimal currency units, never micros |
-| `currency` | STRING | Per row, because markets differ |
-| `attribution_setting` | STRING | Window the platform applied |
-| `raw_metrics` | JSON | Platform-specific extras, kept for auditing |
-| `synced_at` | TIMESTAMP | Fetch time |
-
-Daily granularity is deliberate: it lets any date range, any prior-period comparison, and the weekly charts come from one table.
-
-**A missing metric is NULL, never 0.** Zero means "it genuinely happened zero times"; NULL means unsupported, unrequested or permission-restricted.
-
-### 2.3 `campaign_creatives` — one row per creative
-
-Clustered the same way. A campaign usually has several, which is what the card's `1 / 2` carousel pages through.
-
-| Column | Type | Notes |
-|---|---|---|
-| `platform`, `market`, `campaign_id` | STRING | Join keys |
-| `ad_id`, `creative_id` | STRING | Native ids; LinkedIn uses URNs |
-| `creative_name` | STRING | Caption under the preview ("Finance Offer v1") |
-| `format` | STRING | Text, Vertical Video, Document Ad, … |
-| `position` | INT64 | Carousel order, 1-based |
-| `headline`, `primary_text`, `description`, `call_to_action` | STRING | Ad copy; localised per market |
-| `display_url`, `landing_page_url` | STRING | Shown and clicked respectively |
-| `image_url`, `video_id`, `thumbnail_url` | STRING | Nullable — media URLs expire, so store the reference too |
-| `creative_reference` | STRING | Underlying post/share URN |
-| `is_serving`, `effective_status` | BOOL / STRING | Serving state |
-| `creative_fetched_at` | TIMESTAMP | Fetch time |
+That distinction drives the whole design, because only sourced data can be synced, only calculated data is guaranteed consistent, and unconfirmed data is project risk.
 
 ---
 
-## 3. PostgreSQL tables
+## 2. What the dashboard shows
 
-Django models in `campaigns/models.py`, migration `campaigns/migrations/0001_initial.py`.
+**Present on every screen**
+- Date range selector, language toggle, view switcher
+- Summary strip: Active Campaigns, Total Spend, Performance split (On Track / At Risk / Off Track), Avg CPL
+- Filter sidebar with live counts: Market, Platform, Status, Funnel Stage, Category, Primary KPI
 
-### 3.1 `campaign_targets`
-The target line on the modal chart and the input to the status badge.
+**Overview** — the aggregate picture
+- Five tiles: Total Spend, Upper Funnel spend (value + % of total), Lower Funnel spend, Avg CPL, On Track count
+- Funnel Stage Performance — bar chart with a switchable metric (Spend / On Track / CPL / Impressions / Reach / Clicks)
+- Spend by Platform and Spend by Product Category — two donuts
+- Spend & Conversions — spend bars per campaign with a leads line overlaid
+- Weekly Spend by Platform — stacked weekly bars with a marker on the current, partial week
 
-`platform`, `campaign_id`, `kpi`, `target_value`, `currency`, `direction`, `at_risk_threshold_pct` (default 10), `off_track_threshold_pct` (default 25), `is_primary`, `updated_by`, timestamps.
-Unique on `(platform, campaign_id, kpi)`.
+**Cards** — one card per campaign
+Platform, funnel and category badges · campaign name and ad format · creative preview with carousel · the campaign's primary KPI with its change vs the previous period · a trend sparkline · secondary KPIs · campaign spend · status badge · flag control.
 
-`direction` says whether lower or higher is better — CPL wants to go down, Clicks want to go up — and the thresholds are per campaign so one noisy campaign can be given more room without changing everything.
+**Table** — the same campaigns as rows
+Platform, Campaign, Funnel, Category, Primary KPI, Value, vs Prior, Spend, Status, Trend. With search, column selection, grouping, sorting, multi-select and CSV export.
 
-### 3.2 `campaign_notes`
-`platform`, `campaign_id`, `author`, `body`, timestamps. Backs the **Notes** tab in the modal.
+**Campaign detail** — opened from a card or row
+Creative carousel · primary KPI against its **target** · spend and format · a weekly KPI trend with the target drawn as a line · secondary KPI tiles · a Notes tab · issue flagging.
 
-### 3.3 `campaign_flags`
-`platform`, `campaign_id`, `reason`, `detail`, `status` (`open` / `resolved`), `raised_by`, `resolved_by`, `created_at`, `resolved_at`. Backs **Flag an issue**, the red flag marker on cards, and the **Show flagged** filter.
-
-### 3.4 `campaign_status_overrides`
-`platform`, `campaign_id`, `status`, `note`, `set_by`. Lets a human pin a status when the computed one is wrong. One row per campaign, and it wins over the computed value.
-
-### 3.5 `users`
-Email + `google_sub`, no password. See `accounts/models.py`.
+**One structural point that shapes everything downstream:** the primary KPI is **per campaign, not global**. A lead-generation campaign is judged on CPL, an awareness campaign on Reach or Impressions, a video campaign on Views or CPV. The dashboard must carry each campaign's KPI identity, its unit, and whether higher or lower is better.
 
 ---
 
-## 4. Derived metrics
+## 3. Metric glossary
 
-Nothing below is stored. Each is computed at query time from summed daily rows, so it is correct for any date range. Implemented in `analytics/metrics.py`.
-
-| KPI | Formula | Direction |
+| Term | Meaning | Formula |
 |---|---|---|
-| CPL | `spend / conversions` | lower is better |
-| CPC | `spend / clicks` | lower is better |
-| CPM | `spend / impressions * 1000` | lower is better |
-| CPV | `spend / video_views` | lower is better |
-| CTR | `clicks / impressions` | higher is better |
-| CVR | `conversions / clicks` | higher is better |
-| Clicks, Impressions, Reach, Views, Leads, Spend | summed directly | higher is better |
+| Impressions | Times an ad was displayed | counted |
+| Reach | Unique people who saw it | counted |
+| Clicks | Clicks on the ad | counted |
+| Leads / Conversions | Completed actions of value | counted |
+| Spend | Media cost | counted |
+| **CTR** | Click-Through Rate — % of viewers who clicked | clicks ÷ impressions |
+| **CVR** | Conversion Rate — % of clickers who converted | conversions ÷ clicks |
+| **CPC** | Cost Per Click | spend ÷ clicks |
+| **CPL** | Cost Per Lead | spend ÷ conversions |
+| **CPM** | Cost per 1,000 impressions | spend ÷ impressions × 1000 |
+| **CPV** | Cost Per View | spend ÷ video views |
 
-**Ratios are computed on summed totals, never averaged from daily ratios** — the average of daily CPLs is not the period CPL.
+**Funnel stage** — which part of the buying journey a campaign targets. *Upper* = awareness, *Mid* = consideration, *Lower* = conversion, *Full* = all three. It is how spend is judged: cheap leads are the goal at the lower funnel, cheap reach at the upper.
 
-### Status badge
+---
+
+## 4. Sourced data — what the advertising APIs give us
+
+Three APIs cover the four platforms. **YouTube is not a separate integration** — YouTube campaigns are Google Ads campaigns and come back from the Google Ads API, identified by campaign type.
+
+| Platforms | API | Reporting mechanism |
+|---|---|---|
+| Google, YouTube | Google Ads API | GAQL queries against the reporting service |
+| Meta | Meta Marketing API (Graph) | `campaigns`, `insights` and `adcreatives` edges |
+| LinkedIn | LinkedIn Marketing API | `adCampaigns`, `adAnalytics` and `creatives` resources |
+
+Each platform needs **three separate requests**. No API returns campaign details, performance and creative content together.
+
+**4.1 Campaign metadata** — one record per campaign
+Campaign ID, name, type, objective, status, start and end dates, budget and basis, account ID, currency.
+
+**4.2 Performance** — requested at daily granularity
+Impressions, reach, clicks, video views, conversions, conversion value, spend.
+
+**4.3 Creative content** — one or more per campaign
+Ad and creative IDs, headline, body copy, call to action, destination URL, image or video reference.
+
+### Differences that have to be absorbed
+
+These are the practical reasons a shared schema is needed rather than storing each platform's response as-is.
+
+| Issue | Detail |
+|---|---|
+| Cost units | Google reports cost in micros — one millionth of the account currency. Must be converted on ingest. |
+| Conversions | Meta returns a typed array of actions, not a single conversion count. One action type has to be chosen as "lead"; the rest kept for reference. |
+| Creative completeness | A creative record often references an underlying post rather than containing the text and image. LinkedIn in particular. Resolving it is a further request. |
+| Media URLs | Image and video URLs expire and can be permission-gated. The stable asset reference must be stored alongside the URL. |
+| Reach | Not consistently available on every platform. Must be nullable. |
+| Pagination | Google streams batches, Meta uses cursors, LinkedIn's analytics endpoint has no pagination at all — long date ranges must be split by the caller. |
+| Versioning | Google uses numeric versions, LinkedIn a year-month header, Meta a Graph version. All three deprecate on their own schedule. |
+
+**Access requirements** — a Google Ads developer token plus account-level OAuth; Meta app permissions for reading ads; LinkedIn advertising API approval plus an ad-account role. Read-only access is sufficient throughout. These approvals are typically the longest lead time in the project.
+
+---
+
+## 5. Calculated data — what we derive
+
+Nothing in this section is fetched. All of it is computed from the raw daily counts at the moment a request is made, which is why any date range works without re-syncing.
+
+**5.1 Every ratio KPI** — CTR, CVR, CPC, CPL, CPM, CPV, per the formulas in section 3.
+
+**5.2 Period comparison** — the ± figure under every number compares the selected window against the window of equal length immediately preceding it.
+
+**5.3 Status** — On Track / At Risk / Off Track, by comparing a campaign's primary KPI to its target:
 
 ```
-ratio = target / value     (lower-is-better KPIs)
-ratio = value / target     (higher-is-better KPIs)
-shortfall = (1 - ratio) * 100
-
-shortfall >= off_track_threshold_pct  -> Off Track
-shortfall >= at_risk_threshold_pct    -> At Risk
-otherwise                             -> On Track
+within 10% of target     -> On Track
+10-25% short of target   -> At Risk
+more than 25% short      -> Off Track
 ```
 
-A `campaign_status_overrides` row replaces the result. No target means no badge — not "On Track".
+Direction matters: CPL beating its target means coming in *below* it, Reach means coming in *above* it. Each KPI carries that direction.
 
-### vs prior
+**5.4 All aggregates** — total spend, average CPL, funnel splits and their percentages, spend by platform and category, the status counts, weekly buckets.
 
-The arrow under every KPI compares the selected window against the window of equal length immediately before it. For a lower-is-better KPI a fall is an improvement, so the arrow direction and its colour are independent: direction comes from the sign, colour from `direction`.
+**5.5 All trend lines** — sparklines and the weekly chart are the same KPI recalculated per day or per week.
 
----
+### Two rules that protect the numbers
 
-## 5. UI → data map
+**Ratios are computed on summed totals, never averaged.** The average of 28 daily CPL values is not the 28-day CPL. Averaging ratios weights a quiet Sunday the same as a heavy Monday and produces a number that reconciles with nothing.
 
-### Overview
-| Element | Source |
-|---|---|
-| Total Spend | `SUM(spend)` over the window |
-| Upper / Lower Funnel tiles | Same, filtered by `campaigns.funnel_stage`, with share of total |
-| Avg CPL | `SUM(spend) / SUM(conversions)` across campaigns whose `primary_kpi = 'cpl'` |
-| On Track `51/64` | Count of computed statuses |
-| Funnel Stage Performance | Group by `funnel_stage`; the metric switcher changes only the aggregate, not the grouping |
-| Spend by Platform / by Product Category | Group by `platform` / `product_category` |
-| Spend & Conversions | Per campaign: bar = `SUM(spend)` coloured by platform, line = `SUM(conversions)` |
-| Weekly Spend by Platform | Group by ISO week × platform; the TODAY marker is the current partial week |
-
-### Cards and Table
-Both read the same per-campaign aggregate — the Table is the Cards list with more columns, so one endpoint serves both.
-
-| Element | Source |
-|---|---|
-| Platform / Funnel / Category badges | `campaigns` |
-| Title, format line | `campaign_name`, `ad_format` |
-| Creative preview + `1 / 2` | `campaign_creatives`, ordered by `position` |
-| Primary KPI label and value | `campaigns.primary_kpi` + computed value |
-| vs prior | Prior-window comparison |
-| Sparkline | Daily primary-KPI series across the window |
-| Campaign Spend | `SUM(spend)` |
-| Status badge | Computed, per section 4 |
-| Flag marker | Open rows in `campaign_flags` |
-| Secondary KPIs | The remaining computed metrics |
-
-### Campaign modal
-| Element | Source |
-|---|---|
-| Creative carousel | `campaign_creatives` |
-| Primary KPI vs TARGET | Computed value + `campaign_targets.target_value` |
-| Campaign Spend, Format | `campaign_performance_daily`, `campaigns` |
-| Weekly KPI trend + target line | Primary KPI per ISO week + the flat target |
-| Secondary KPI tiles | Computed |
-| Notes tab | `campaign_notes` |
-| Flag an issue | `campaign_flags` |
-
-### Sidebar filters
-Market, Platform, Status, Funnel Stage, Category, Primary KPI. All but Status are columns on `campaigns` and filter in BigQuery; **Status is computed from Postgres targets, so it is applied after aggregation**, in the API.
+**A missing metric is null, never zero.** Zero means it genuinely happened zero times. Null means unsupported by that platform, not requested, or restricted. Collapsing the two silently corrupts every average built on top.
 
 ---
 
-## 6. Currency
+## 6. Unconfirmed data — no identified source
 
-`spend` carries its own `currency`, because UK campaigns bill in GBP and IT/FR/DE in EUR. The mockups show a single `€1.5M` total across both, which is only correct if a reporting currency with FX conversion is defined.
+Everything here is on the prototype screens but has no confirmed origin. Some may be real requirements; some may be prototype decoration. Each needs a decision.
 
-Until then: the API returns the per-row currency, and totals are only summed within one currency. When FX arrives, the normalised amount, the rate and the rate date get stored alongside the original — the original is never overwritten.
+### Blocking — these change the data model
 
----
+**Q1. Funnel stage, product category, market, and primary KPI.**
+The dashboard filters, groups and judges campaigns by these four. **None of them exist in any advertising API.** Possible sources: parsed from a campaign naming convention, supplied as a mapping by the client, inferred from the ad account, or maintained by hand in this tool.
+*Impact:* if they are maintained by hand or supplied separately, they are our data, not platform data, and belong in the operational database rather than the analytics warehouse. This is the single most important question to resolve.
 
-## 7. Commands
+**Q2. Is there one reporting currency?**
+UK campaigns bill in GBP, the others in EUR, yet the summary tiles show a single total. A combined total is only meaningful with a defined reporting currency and FX source.
+*Impact:* if conversion is required we need the target currency, the rate source, and whether rates are daily or fixed per period.
 
-| Command | Does |
-|---|---|
-| `manage.py bq_init` | Creates the dataset and the three tables (`--dry-run` prints the DDL) |
-| `manage.py seed_demo_data` | Generates 64 campaigns × 180 days + creatives as NDJSON in `seed_data/`, and writes matching KPI targets to Postgres |
-| `manage.py seed_demo_data --load-bq` | Same, and loads it into BigQuery |
+**Q3. What counts as a lead, per platform?**
+CPL is compared across platforms throughout the dashboard. Each platform defines conversions differently, and Meta does not define one at all without choosing an action type.
+*Impact:* without a single agreed definition, cross-platform CPL comparison is not valid, however well it renders.
 
-The generator in `analytics/catalogue.py` and `analytics/seed.py` reproduces the mockups: 64 campaigns across 4 markets (Google 20, YouTube 16, LinkedIn 16, Meta 12), ~€1.55M of 28-day spend, and a 51 / 3 / 10 status split. It is deterministic — the same `--as-of` always gives the same numbers.
+### Needed before the numbers can be trusted
 
----
+**Q4. Who sets KPI targets, and at what level?** Per campaign, or inherited from a market or funnel goal? Where do they live today?
 
-## 8. When the real APIs arrive
+**Q5. Are targets tied to a period?** A target of 55 is meaningless without a window. If targets are monthly but a user selects a 7-day range, the comparison is wrong. Either targets are rated per period, or the comparison is restricted to matching windows.
 
-The ingestion jobs write to the same three tables; nothing above changes.
+**Q6. Are the 10% / 25% status thresholds client-defined,** or placeholders? They are currently assumptions.
 
-| Platform | Campaigns | Performance | Creatives |
-|---|---|---|---|
-| Google / YouTube | GAQL `campaign` via `googleAds:searchStream` | Same query with `segments.date` | `ad_group_ad` |
-| Meta | `act_{id}/campaigns` | `/insights` with `time_increment=1` | `adcreatives` |
-| LinkedIn | `adAccounts/{id}/adCampaigns` | `adAnalytics?q=statistics&pivots=List(CAMPAIGN)&timeGranularity=DAILY` | `adAccounts/{id}/creatives` |
+**Q7. Which timezone defines a day?** Four markets can mean four day boundaries. One reporting timezone is needed or totals will not reconcile against each platform's own interface.
 
-Points to hold to when wiring them up:
-
-- Request **daily** granularity everywhere, so the fact table stays per-day.
-- Google returns `cost_micros` — divide by 1,000,000 before storing.
-- Meta returns `actions` as a typed array; map one defined action to `conversions` and keep the rest in `raw_metrics`.
-- LinkedIn's analytics finder has no pagination — split long date ranges instead.
-- Re-syncing a day must replace that day's rows, not append. Partitioning by `date` makes that a partition overwrite.
-- Keep `synced_at` current; the UI's freshness indicator reads it.
-
----
-
-## 9. Open questions for the team
-
-Everything below was assumed in order to keep building. Each one has a note on what we did and what changes if the answer differs.
-
-### Blocking — these change where columns live
-
-**9.1 Where do `funnel_stage`, `product_category`, `market` and `primary_kpi` come from?**
-None of these exist in the Google, Meta or LinkedIn APIs, but the dashboard filters and groups by all four. They are currently columns on the `campaigns` table, as if they arrive with the data.
-Candidates: parsed from a campaign naming convention, supplied as a mapping sheet by the client, derived from the ad account, or set by hand in our own UI.
-If they are set by hand or come from a mapping sheet, they belong in Postgres, not BigQuery — a mapping table keyed on `(platform, campaign_id)`.
-
-**9.2 Is there a single reporting currency?**
-UK campaigns bill in GBP, IT/FR/DE in EUR, but the mockups show one `€1.5M` total across both, and Avg CPL appears as `€7` on Cards and `$7` on Overview.
-Currently spend carries its own currency per row and nothing is converted. If a single reporting currency is required we need: which one, the FX source, and whether the rate is daily or fixed per period.
-
-**9.3 What counts as a conversion, per platform?**
-The dashboard shows "Leads" and CPL across all four platforms as if they were comparable. Google conversions depend on the account's conversion setup, Meta returns a typed `actions` array with no universal "conversion", LinkedIn differs again.
-We need the canonical definition per platform, otherwise CPL is not comparable across a row of the table.
-
-### Needed before the numbers are trustworthy
-
-**9.4 Who sets KPI targets, and at what level?**
-Targets are per campaign per KPI in Postgres right now. Are they set per campaign, or inherited from a market/funnel-level goal? Where do they live today — a spreadsheet? Should they be editable in the dashboard, and by whom?
-
-**9.5 Is a target tied to a period?**
-A target of 55 means nothing without a window. The current model treats it as a flat line compared against whatever range the user selects. If targets are monthly, selecting "Last 7 days" compares against a monthly figure and will read wrong.
-
-**9.6 Are the 10% / 25% status bands right?**
-At Risk at 10% off target and Off Track at 25% are our defaults, stored per campaign so they can be tuned. Has the client defined these?
-
-**9.7 Which timezone defines a "day"?**
-Each ad account reports in its own timezone. Four markets means four possible day boundaries. We need one reporting timezone for comparisons, or the totals will not reconcile with each platform's own UI.
-
-**9.8 What is the attribution window?**
-Stored per row as `attribution_setting` but not yet normalised. Platforms default differently, which affects every conversion number.
+**Q8. What attribution window applies?** Platforms default differently, and attribution changes every conversion figure.
 
 ### Operational
 
-**9.9 Who runs the ingestion into BigQuery — their team or us?**
-This decides whether we build the sync jobs or just read tables someone else populates.
+**Q9. Who runs the data ingestion — the client's team or ours?** Determines whether we build the sync layer or read tables someone else populates.
 
-**9.10 How often does the data refresh, and what does "Live — BigQuery" promise?**
-Drives caching, and whether the indicator means "synced within N hours" or just "connected".
+**Q10. How often must data refresh,** and what does the live data indicator promise — freshness within a set period, or just connectivity?
 
-**9.11 How much history is needed?**
-Affects partition retention and how far back "vs prior" can go.
+**Q11. How much history is required?** Drives retention and how far back period comparison can reach.
 
-**9.12 Creative media — who hosts the images and video thumbnails?**
-Platform media URLs expire and are often permission-gated. We store the native reference as well as the URL, but if the dashboard must show previews reliably, the assets need copying to our own storage.
+**Q12. Who hosts creative images and video thumbnails?** Platform URLs expire. Reliable previews require copying assets to our own storage.
 
-**9.13 Does every user see all 64 campaigns?**
-There is no per-market or per-role access control at the moment. If a dealer or market lead should only see their own market, that changes the auth model.
+**Q13. Does every user see all markets?** There is no per-market or per-role access model defined. If a market lead should only see their own market, that is a requirement, not a detail.
 
-**9.14 Is the EN language toggle frontend-only?**
-Assumed yes — the API returns raw values and the frontend renders the labels. Creative copy is already localised in the data itself.
+**Q14. Is the language toggle translating the interface, the ad copy, or nothing yet?**
 
-**9.15 Can notes and flags attach to anything other than a campaign?**
-Currently campaign-level only. No assignment, notification or workflow beyond open/resolved.
+**Q15. Can notes and flags attach to anything other than a campaign,** and is there a workflow beyond open and resolved — assignment, notification, audit?
+
+---
+
+## 7. Data structure
+
+### 7.1 Two stores, one rule
+
+| Store | Holds | Written by |
+|---|---|---|
+| **Analytics warehouse (BigQuery)** | Campaign metadata, daily performance, creatives | The ingestion that reads the advertising APIs |
+| **Operational database (PostgreSQL)** | Users, KPI targets, notes, flagged issues, status overrides | The dashboard, from user actions |
+
+**What the platforms tell us is separated from what our users tell us.** User input never enters the warehouse, and a sync never overwrites user input. The two have completely different update patterns: one is bulk-loaded and re-synced wholesale, the other is small, transactional and must never be lost.
+
+A campaign is identified everywhere by **(platform, campaign_id)**, using the platform's own identifier, stored as text. Platform IDs are not all numeric — LinkedIn uses URNs — and they are never arithmetic, so text is correct.
+
+### 7.2 Three analytics tables, not one
+
+A single flat table is tempting and wrong: campaign details change rarely, performance changes daily, creatives change independently of both. Combining them forces re-writing unchanged data and loses the ability to trace a discrepancy to one source. One wide view can always be assembled on top for consumption.
+
+**`campaigns`** — one row per campaign
+
+| Column | Type | Note |
+|---|---|---|
+| platform, market | STRING | |
+| ad_account_id, campaign_id | STRING | Native identifiers |
+| campaign_name | STRING | |
+| campaign_type, campaign_type_raw | STRING | Normalised value plus the untouched platform value |
+| objective, objective_raw | STRING | Same pattern |
+| funnel_stage, product_category | STRING | **See Q1 — source unconfirmed** |
+| ad_format | STRING | Display label |
+| primary_kpi | STRING | **See Q1** |
+| platform_status, platform_status_raw, effective_status | STRING | Serving state — *not* the On Track badge |
+| start_date, end_date | DATE | |
+| budget_amount, budget_period, currency | NUMERIC / STRING | |
+| source_updated_at, synced_at | TIMESTAMP | Platform's own timestamp, and ours |
+
+**`campaign_performance_daily`** — one row per campaign per day. Partitioned by date, clustered by platform, market and campaign.
+
+| Column | Type | Note |
+|---|---|---|
+| platform, market, campaign_id | STRING | Join keys |
+| date | DATE | Partition key |
+| impressions, reach, clicks | INT64 | Reach nullable |
+| video_views, video_completions | INT64 | Null for non-video |
+| conversions, conversion_value | NUMERIC | **See Q3** |
+| spend, currency | NUMERIC / STRING | Decimal units, never micros |
+| attribution_setting | STRING | **See Q8** |
+| raw_metrics | JSON | Platform-specific extras, kept for audit |
+| synced_at | TIMESTAMP | |
+
+**Daily granularity is the single most important design decision here.** Storing a pre-aggregated period would fix the dashboard to one date range. Daily rows let any range, any comparison period and any weekly bucket be answered from one table, and let a single day be corrected without touching the rest.
+
+**`campaign_creatives`** — one row per creative
+
+| Column | Type | Note |
+|---|---|---|
+| platform, market, campaign_id | STRING | Join keys |
+| ad_id, creative_id | STRING | Native identifiers |
+| creative_name, format, position | STRING / INT64 | Position orders the card carousel |
+| headline, primary_text, description, call_to_action | STRING | Localised per market |
+| display_url, landing_page_url | STRING | |
+| image_url, video_id, thumbnail_url | STRING | Nullable — **see Q12** |
+| creative_reference | STRING | Stable asset reference, outlives the URL |
+| is_serving, effective_status | BOOL / STRING | |
+| creative_fetched_at | TIMESTAMP | |
+
+### 7.3 Operational tables
+
+| Table | Holds |
+|---|---|
+| `campaign_targets` | Target value per campaign and KPI, its direction, and the At Risk / Off Track thresholds |
+| `campaign_notes` | Commentary against a campaign, with author and timestamp |
+| `campaign_flags` | Raised issues, with reason, author, open/resolved state and who resolved them |
+| `campaign_status_overrides` | A manually pinned status, for when the calculated one is wrong |
+| `users` | Dashboard users, authenticated by Google sign-in |
+
+**Status is calculated at read time, never stored.** Changing a target instantly corrects every historical view. A stored status would need recalculating across all history on every target change, and would drift the moment that failed.
+
+---
+
+## 8. Principles carried through the design
+
+1. **Keep the raw value next to the normalised one.** Every `_raw` column exists so a discrepancy can be traced back to what the platform actually said.
+2. **Store counts, derive ratios.** Counts are facts; ratios are interpretations and depend on the window.
+3. **Null is not zero.**
+4. **Re-syncing a day replaces that day.** Date partitioning makes a re-sync a partition overwrite rather than a duplicate-prone merge.
+5. **Keep the currency with the amount.** Converting on the way in destroys the original. Any conversion keeps the amount, the rate and the rate date separately.
+6. **Record sync time on every row.** Freshness is a fact the dashboard displays and support questions depend on.
+
+---
+
+## 9. Risks
+
+| Risk | Why it matters |
+|---|---|
+| **API access approvals** | Google developer tokens, Meta app review and LinkedIn advertising API approval are external dependencies with their own timelines. Usually the critical path. |
+| **Q1 unresolved** | Four fields the dashboard is organised around have no confirmed source. The longer it is open, the more is built on an assumption. |
+| **Cross-platform comparability** | Conversions, attribution and video view definitions differ. The dashboard presents them side by side as though they do not. |
+| **Reconciliation** | Totals will be checked against each platform's own interface. Timezone, attribution and currency decisions determine whether they match. |
+| **Creative assets** | Expiring URLs mean previews degrade over time unless assets are copied to our own storage. |
+
+---
+
+## 10. Recommended next steps
+
+1. Resolve **Q1, Q2 and Q3** with the client — each changes the data model, not just a display.
+2. Start the **platform access approvals** immediately; they run in parallel with everything else.
+3. Confirm the **target-setting process** (Q4, Q5) — the status badge is the dashboard's main judgement and it rests entirely on this.
+4. Validate one market and one platform end to end against the platform's own reporting interface before extending to all four.
+5. Agree a **reporting timezone and attribution basis** in writing, since both change every number.
