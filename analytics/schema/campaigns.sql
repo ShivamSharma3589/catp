@@ -1,0 +1,26 @@
+CREATE TABLE IF NOT EXISTS `{dataset}.campaigns` (
+  platform STRING NOT NULL,
+  market STRING NOT NULL,
+  ad_account_id STRING,
+  campaign_id STRING NOT NULL,
+  campaign_name STRING NOT NULL,
+  campaign_type STRING,
+  campaign_type_raw STRING,
+  objective STRING,
+  objective_raw STRING,
+  funnel_stage STRING,
+  product_category STRING,
+  ad_format STRING,
+  primary_kpi STRING,
+  platform_status STRING,
+  platform_status_raw STRING,
+  effective_status STRING,
+  start_date DATE,
+  end_date DATE,
+  budget_amount NUMERIC,
+  budget_period STRING,
+  currency STRING,
+  source_updated_at TIMESTAMP,
+  synced_at TIMESTAMP NOT NULL
+)
+CLUSTER BY platform, market, campaign_id;
