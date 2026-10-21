@@ -233,3 +233,64 @@ Points to hold to when wiring them up:
 - LinkedIn's analytics finder has no pagination — split long date ranges instead.
 - Re-syncing a day must replace that day's rows, not append. Partitioning by `date` makes that a partition overwrite.
 - Keep `synced_at` current; the UI's freshness indicator reads it.
+
+---
+
+## 9. Open questions for the team
+
+Everything below was assumed in order to keep building. Each one has a note on what we did and what changes if the answer differs.
+
+### Blocking — these change where columns live
+
+**9.1 Where do `funnel_stage`, `product_category`, `market` and `primary_kpi` come from?**
+None of these exist in the Google, Meta or LinkedIn APIs, but the dashboard filters and groups by all four. They are currently columns on the `campaigns` table, as if they arrive with the data.
+Candidates: parsed from a campaign naming convention, supplied as a mapping sheet by the client, derived from the ad account, or set by hand in our own UI.
+If they are set by hand or come from a mapping sheet, they belong in Postgres, not BigQuery — a mapping table keyed on `(platform, campaign_id)`.
+
+**9.2 Is there a single reporting currency?**
+UK campaigns bill in GBP, IT/FR/DE in EUR, but the mockups show one `€1.5M` total across both, and Avg CPL appears as `€7` on Cards and `$7` on Overview.
+Currently spend carries its own currency per row and nothing is converted. If a single reporting currency is required we need: which one, the FX source, and whether the rate is daily or fixed per period.
+
+**9.3 What counts as a conversion, per platform?**
+The dashboard shows "Leads" and CPL across all four platforms as if they were comparable. Google conversions depend on the account's conversion setup, Meta returns a typed `actions` array with no universal "conversion", LinkedIn differs again.
+We need the canonical definition per platform, otherwise CPL is not comparable across a row of the table.
+
+### Needed before the numbers are trustworthy
+
+**9.4 Who sets KPI targets, and at what level?**
+Targets are per campaign per KPI in Postgres right now. Are they set per campaign, or inherited from a market/funnel-level goal? Where do they live today — a spreadsheet? Should they be editable in the dashboard, and by whom?
+
+**9.5 Is a target tied to a period?**
+A target of 55 means nothing without a window. The current model treats it as a flat line compared against whatever range the user selects. If targets are monthly, selecting "Last 7 days" compares against a monthly figure and will read wrong.
+
+**9.6 Are the 10% / 25% status bands right?**
+At Risk at 10% off target and Off Track at 25% are our defaults, stored per campaign so they can be tuned. Has the client defined these?
+
+**9.7 Which timezone defines a "day"?**
+Each ad account reports in its own timezone. Four markets means four possible day boundaries. We need one reporting timezone for comparisons, or the totals will not reconcile with each platform's own UI.
+
+**9.8 What is the attribution window?**
+Stored per row as `attribution_setting` but not yet normalised. Platforms default differently, which affects every conversion number.
+
+### Operational
+
+**9.9 Who runs the ingestion into BigQuery — their team or us?**
+This decides whether we build the sync jobs or just read tables someone else populates.
+
+**9.10 How often does the data refresh, and what does "Live — BigQuery" promise?**
+Drives caching, and whether the indicator means "synced within N hours" or just "connected".
+
+**9.11 How much history is needed?**
+Affects partition retention and how far back "vs prior" can go.
+
+**9.12 Creative media — who hosts the images and video thumbnails?**
+Platform media URLs expire and are often permission-gated. We store the native reference as well as the URL, but if the dashboard must show previews reliably, the assets need copying to our own storage.
+
+**9.13 Does every user see all 64 campaigns?**
+There is no per-market or per-role access control at the moment. If a dealer or market lead should only see their own market, that changes the auth model.
+
+**9.14 Is the EN language toggle frontend-only?**
+Assumed yes — the API returns raw values and the frontend renders the labels. Creative copy is already localised in the data itself.
+
+**9.15 Can notes and flags attach to anything other than a campaign?**
+Currently campaign-level only. No assignment, notification or workflow beyond open/resolved.
